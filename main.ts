@@ -7,8 +7,8 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { dirname, resolve, sep } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
@@ -37,7 +37,20 @@ function patchLines(text: string): string[] {
 }
 
 function safe(p: string): boolean {
-  return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+  if (p === '' || p.startsWith('/') || p.includes('\\') || !p.split('/').every((s) => s !== '' && s !== '.' && s !== '..')) return false;
+  const root = realpathSync('.');
+  let probe = resolve(root, p);
+  while (true) {
+    try {
+      const actual = realpathSync(probe);
+      return actual === root || actual.startsWith(root + sep);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      const parent = dirname(probe);
+      if (parent === probe) return false;
+      probe = parent;
+    }
+  }
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -172,30 +185,37 @@ function fileText(text: string): FileText {
   const lines=text.split(br), final=text.endsWith(br); if(final) lines.pop(); return {lines,br,final};
 }
 function render(f:FileText):string{return f.lines.length?f.lines.join(f.br)+(f.final?f.br:''):'';}
+let temporarySequence=0;
+function atomicWrite(path:string,text:string):void{
+ mkdirSync(dirname(path),{recursive:true});
+ const temporary=`${path}.mend-tmp-${process.pid}-${temporarySequence++}`;
+ try{writeFileSync(temporary,text,{flag:'wx'});renameSync(temporary,path);}catch(error){rmSync(temporary,{force:true});throw error;}
+}
 const trail=(s:string)=>s.replace(/[ \t]+$/g,'');
 const both=(s:string)=>s.replace(/^[ \t]+|[ \t]+$/g,'');
 function eq(a:string,b:string,t:number){return t===0?a===b:t===1?trail(a)===trail(b):both(a)===both(b);}
-function occurrences(lines:string[],old:string[],strict:boolean,start=0):{tier:number,at:number[]}|null{
- for(let tier=0;tier<=(strict?0:2);tier++){const at:number[]=[];for(let i=start;i+old.length<=lines.length;i++)if(old.every((v,k)=>eq(lines[i+k]!,v,tier)))at.push(i);if(at.length)return{tier,at};}return null;
+function occurrences(lines:string[],old:string[],strict:boolean,start=0,endOnly=false):{tier:number,at:number[]}|null{
+ for(let tier=0;tier<=(strict?0:2);tier++){const at:number[]=[];for(let i=start;i+old.length<=lines.length;i++)if((!endOnly||i+old.length===lines.length)&&old.every((v,k)=>eq(lines[i+k]!,v,tier)))at.push(i);if(at.length)return{tier,at};}return null;
 }
 function replaceLines(f:FileText,at:number,old:string[],neu:string[],tier:number,context:number[]=[]){
  const F=(f.lines[at]??'').match(/^[ \t]*/)![0],P=(old[0]??'').match(/^[ \t]*/)![0];
  const out=neu.map((line,i)=>{if(context[i]!==undefined)return f.lines[at+context[i]!]!;return tier===2&&!blank(line)&&line.startsWith(P)?F+line.slice(P.length):line;});
  f.lines.splice(at,old.length,...out);
 }
-interface Hunk{a:number;old:string[];neu:string[];context:number[];noBreak:boolean}
+interface Hunk{a:number;old:string[];neu:string[];context:number[];noBreak:boolean;lastKind:string}
 interface USection{oldPath:string|null;newPath:string|null;create:boolean;del:boolean;hunks:Hunk[]}
 function unPath(s:string):string|null{let p=s.slice(4).split('\t')[0]!.trim();if(p==='/dev/null')return null;if(p.startsWith('a/')||p.startsWith('b/'))p=p.slice(2);return p;}
 function unifiedEdits(lines:string[],strict:boolean):Edit[]{
  const sections:USection[]=[];let sec:USection|null=null,h:Hunk|null=null;
  for(let i=0;i<lines.length;i++){
   const l=lines[i]!;
+  if(sec&&(sec.del||sec.newPath===null)&&!l.startsWith('diff --git ')&&!(l.startsWith('--- ')&&(lines[i+1]??'').startsWith('+++ ')))continue;
   if(h){
    if(!(l===''||l.startsWith(' ')||l.startsWith('-')||l.startsWith('+')||l.startsWith('\\'))){while(h.context[h.neu.length-1]===h.old.length-1&&h.old.at(-1)===''){h.old.pop();h.neu.pop();h.context.pop();}}
    if(l.startsWith('diff --git ')||l.startsWith('@@')||(l.startsWith('--- ')&&(lines[i+1]??'').startsWith('+++ ')))h=null;
    else if(l===''||l.startsWith(' ')||l.startsWith('-')||l.startsWith('+')||l.startsWith('\\')){
-    if(l.startsWith('\\')){h.noBreak=true;continue;}h.noBreak=false;const text=l===''?'':l.slice(1);
-    if(l.startsWith('-'))h.old.push(text);else if(l.startsWith('+'))h.neu.push(text);else{h.context[h.neu.length]=h.old.length;h.old.push(text);h.neu.push(text);}continue;
+    if(l.startsWith('\\')){if(h.lastKind==='context'||h.lastKind==='add')h.noBreak=true;continue;}const text=l===''?'':l.slice(1);
+    if(l.startsWith('-')){h.old.push(text);h.lastKind='delete';}else if(l.startsWith('+')){h.neu.push(text);h.noBreak=false;h.lastKind='add';}else{h.context[h.neu.length]=h.old.length;h.old.push(text);h.neu.push(text);h.noBreak=false;h.lastKind='context';}continue;
    }else h=null;
   }
   if(l.startsWith('diff --git ')){
@@ -209,7 +229,7 @@ function unifiedEdits(lines:string[],strict:boolean):Edit[]{
   }
   if(l.startsWith('@@')){
    const m=/^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/.exec(l);if(!m||!sec)throw new Exit2(`error: parse ${i+1}`);
-   h={a:Number(m[1]),old:[],neu:[],context:[],noBreak:false};sec.hunks.push(h);continue;
+   h={a:Number(m[1]),old:[],neu:[],context:[],noBreak:false,lastKind:''};sec.hunks.push(h);continue;
   }
   if(sec&&!sec.hunks.length){
    if(l.startsWith('rename from '))sec.oldPath=l.slice(12);else if(l.startsWith('rename to '))sec.newPath=l.slice(10);
@@ -218,14 +238,15 @@ function unifiedEdits(lines:string[],strict:boolean):Edit[]{
  }
  return sections.map(s=>{
   const edit:Edit=(tree:Tree)=>{
+  const create=s.create||s.oldPath===null,del=s.del||s.newPath===null;
   const old=s.oldPath??'',neu=s.newPath??old;
-  if(!s.create&&!safe(old))throw new Fail('unsafe',old);if(!s.del&&!safe(neu))throw new Fail('unsafe',neu);
-  if(s.create){if(tree.get(neu)!==null)throw new Fail('exists',neu);const f:FileText={lines:s.hunks.flatMap(x=>x.neu),br:'\n',final:true};if(s.hunks.at(-1)?.noBreak)f.final=false;tree.now.set(neu,render(f));return;}
-  const before=tree.get(old);if(before===null)throw new Fail('missing',old);if(s.del){tree.now.set(old,null);return;}
+  if(!create&&!safe(old))throw new Fail('unsafe',old);if(!del&&!safe(neu))throw new Fail('unsafe',neu);
+  if(create){if(tree.get(neu)!==null)throw new Fail('exists',neu);const f:FileText={lines:s.hunks.flatMap(x=>x.neu),br:'\n',final:true};if(s.hunks.at(-1)?.noBreak)f.final=false;tree.now.set(neu,render(f));return;}
+  const before=tree.get(old);if(before===null)throw new Fail('missing',old);if(del){tree.now.set(old,null);return;}
   if(neu!==old&&tree.get(neu)!==null)throw new Fail('exists',neu);
   const f=fileText(before);let d=0;
   for(const x of s.hunks){
-   if(!x.old.length){const at=Math.min(x.a+d,f.lines.length);f.lines.splice(at,0,...x.neu);if(at+x.neu.length===f.lines.length)f.final=!x.noBreak;}
+   if(!x.old.length){const at=Math.max(0,Math.min(x.a+d,f.lines.length));f.lines.splice(at,0,...x.neu);if(at+x.neu.length===f.lines.length)f.final=!x.noBreak;}
    else{const found=occurrences(f.lines,x.old,strict);if(!found)throw new Fail('no-match',old);const target=x.a-1+d;const at=found.at.reduce((b,v)=>Math.abs(v-target)<Math.abs(b-target)?v:b,found.at[0]!);const end=at+x.old.length===f.lines.length;replaceLines(f,at,x.old,x.neu,found.tier,x.context);if(end)f.final=!x.noBreak;}
    d+=x.neu.length-x.old.length;
   }
@@ -243,7 +264,7 @@ function searchEdits(lines:string[],strict:boolean):Edit[]{
   if(!path)path=previous;if(!path)throw new Exit2(`error: parse ${i+1}`);
   let mid=-1,end=-1;for(let j=i+1;j<lines.length;j++){if(mid<0&&lines[j]!.trimEnd()==='=======')mid=j;if(mid>=0&&lines[j]!.trimEnd()==='>>>>>>> REPLACE'){end=j;break;}}
   if(mid<0||end<0)throw new Exit2(`error: parse ${i+1}`);const old=lines.slice(i+1,mid),neu=lines.slice(mid+1,end);
-  edits.push(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(!old.length){if(tree.get(path)!==null)throw new Fail('exists',path);tree.now.set(path,neu.join('\n')+'\n');return;}const before=tree.get(path);if(before===null)throw new Fail('missing',path);const found=occurrences(fileText(before).lines,old,strict);if(!found)throw new Fail('no-match',path);if(found.at.length!==1)throw new Fail('ambiguous',path);const f=fileText(before);replaceLines(f,found.at[0]!,old,neu,found.tier);tree.now.set(path,render(f));});
+  edits.push(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(!old.length){if(tree.get(path)!==null)throw new Fail('exists',path);tree.now.set(path,neu.length?neu.join('\n')+'\n':'');return;}const before=tree.get(path);if(before===null)throw new Fail('missing',path);const found=occurrences(fileText(before).lines,old,strict);if(!found)throw new Fail('no-match',path);if(found.at.length!==1)throw new Fail('ambiguous',path);const f=fileText(before);replaceLines(f,found.at[0]!,old,neu,found.tier);tree.now.set(path,render(f));});
   previous=path;last=end;i=end;
  }return edits;
 }
@@ -257,14 +278,14 @@ function v4aEdits(lines:string[],strict:boolean):Edit[]{
   if(!add&&!del&&!update)throw new Exit2(`error: parse ${i+1}`);const start=i,path=l.slice(l.indexOf(': ')+2).trim();i++;
   let end=i;while(end<last&&!lines[end]!.startsWith('*** Add File: ')&&!lines[end]!.startsWith('*** Delete File: ')&&!lines[end]!.startsWith('*** Update File: '))end++;
   let body=lines.slice(i,end);while(body.length&&blank(body[body.length-1]!))body.pop();
-  if(add){const bad=body.findIndex(x=>x!==''&&!x.startsWith('+'));if(bad>=0)throw new Exit2(`error: parse ${i+1+bad}`);const text=body.map(x=>x===''?'':x.slice(1)).join('\n')+'\n';edits.push(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(tree.get(path)!==null)throw new Fail('exists',path);tree.now.set(path,text);});}
+  if(add){const bad=body.findIndex(x=>x!==''&&!x.startsWith('+'));if(bad>=0)throw new Exit2(`error: parse ${i+1+bad}`);const added=body.map(x=>x===''?'':x.slice(1));const text=added.length?added.join('\n')+'\n':'';edits.push(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(tree.get(path)!==null)throw new Fail('exists',path);tree.now.set(path,text);});}
   else if(del){if(body.length)throw new Exit2(`error: parse ${i+1}`);edits.push(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(tree.get(path)===null)throw new Fail('missing',path);tree.now.set(path,null);});}
   else{
    let move:string|null=null;if(body[0]?.startsWith('*** Move to: ')){move=body[0].slice(13).trim();body=body.slice(1);}const chunks:Chunk[]=[];let c:Chunk|null=null;
    for(let j=0;j<body.length;j++){const x=body[j]!;if(x.startsWith('@@')){c={anchor:x.slice(2).trim()||null,eof:false,old:[],neu:[],context:[]};chunks.push(c);continue;}if(x==='*** End of File'){if(!c)throw new Exit2(`error: parse ${i+1+j+(move?1:0)}`);c.eof=true;c=null;continue;}if(x!==''&&![' ','-','+'].includes(x[0]!))throw new Exit2(`error: parse ${i+1+j+(move?1:0)}`);if(!c){c={anchor:null,eof:false,old:[],neu:[],context:[]};chunks.push(c);}const text=x===''?'':x.slice(1);if(x.startsWith('-'))c.old.push(text);else if(x.startsWith('+'))c.neu.push(text);else{c.context[c.neu.length]=c.old.length;c.old.push(text);c.neu.push(text);}}
    if(!chunks.length&&!move)throw new Exit2(`error: parse ${start+1}`);
    edits.push(Object.assign(tree=>{if(!safe(path))throw new Fail('unsafe',path);if(move!==null&&!safe(move))throw new Fail('unsafe',move);const before=tree.get(path);if(before===null)throw new Fail('missing',path);if(move!==null&&tree.get(move)!==null)throw new Fail('exists',move);const f=fileText(before);let cursor=0;
-    for(const x of chunks){if(x.anchor!==null){const found=occurrences(f.lines,[x.anchor],strict,cursor);if(!found)throw new Fail('no-match',path);cursor=found.at[0]!+1;}let at=cursor,tier=0;if(x.old.length){const found=occurrences(f.lines,x.old,strict,cursor);if(!found)throw new Fail('no-match',path);const valid=x.eof?found.at.filter(v=>v+x.old.length===f.lines.length):found.at;if(!valid.length)throw new Fail('no-match',path);at=valid[0]!;tier=found.tier;}else if(x.eof)at=f.lines.length;replaceLines(f,at,x.old,x.neu,tier,x.context);cursor=at+x.neu.length;}
+    for(const x of chunks){if(x.anchor!==null){const found=occurrences(f.lines,[x.anchor],strict,cursor);if(!found)throw new Fail('no-match',path);cursor=found.at[0]!+1;}let at=cursor,tier=0;if(x.old.length){const found=occurrences(f.lines,x.old,strict,cursor,x.eof);if(!found)throw new Fail('no-match',path);at=found.at[0]!;tier=found.tier;}else if(x.eof)at=f.lines.length;replaceLines(f,at,x.old,x.neu,tier,x.context);cursor=at+x.neu.length;}
     if(move!==null){tree.now.set(path,null);tree.now.set(move,render(f));}else tree.now.set(path,render(f));},move?{move:[path,move]}:{}));
   }i=end;
  }return edits;
@@ -337,7 +358,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (!check) for (const [p, now] of tree.now) {
     if (tree.original(p) === now) continue;
     if (now === null) rmSync(p, { force: true });
-    else { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, now); }
+    else atomicWrite(p, now);
   }
   return { code: 0, out: [...rows.map((r) => r.line), `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
 }
